@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # misconfig-ConfigIdempotencyTester
 Verifies that applying the same configuration multiple times results in the same system state, highlighting potential side effects or state dependencies in configuration changes. Leverages idempotent REST requests and system state checksumming. - Focused on Check for misconfigurations in configuration files or infrastructure definitions
 
