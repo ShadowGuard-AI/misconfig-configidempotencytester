@@ -1,11 +1,51 @@
 import argparse
 import hashlib
+import json
 import logging
 import os
 import subprocess
 import sys
 import tempfile
 import shutil
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
+def read_and_check_config(config_file):
+    """
+    Read the configuration the tool is about to certify. An empty or
+    unparseable file gets no verdict: the run exits before any
+    application. Returns True only for a file that parsed to content.
+    """
+    try:
+        with open(config_file, "r") as f:
+            raw = f.read()
+    except OSError as e:
+        logging.error(f"Could not read configuration file {config_file}: {e}")
+        return False
+    if raw.strip() == "":
+        logging.error(f"Configuration file {config_file} is empty; no idempotency verdict can be given.")
+        return False
+    lower = config_file.lower()
+    try:
+        if lower.endswith(".json"):
+            data = json.loads(raw)
+        elif lower.endswith((".yaml", ".yml")):
+            if yaml is None:
+                return True  # Non-empty text; no parser available here.
+            data = yaml.safe_load(raw)
+        else:
+            return True  # Content present; type honesty is validate_config's job.
+    except Exception as e:
+        logging.error(f"Configuration file {config_file} could not be parsed: {e}")
+        return False
+    if data is None or data == {} or data == []:
+        logging.error(f"Configuration file {config_file} parses to nothing; no idempotency verdict can be given.")
+        return False
+    return True
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,8 +80,8 @@ def validate_config(config_file):
                 logging.error(f"JSON validation failed:\n{result.stderr}")
                 return False
         else:
-            logging.warning("Unknown file type. Skipping validation.")
-            return True #Allow unknown filetypes to pass validation
+            logging.error("Unknown file type. Validation cannot check this file, so it does not pass.")
+            return False
         logging.info(f"Configuration file {config_file} validated successfully.")
         return True
     except FileNotFoundError as e:
@@ -74,7 +114,11 @@ def apply_configuration(config_file, apply_command):
     Replaces `{config_file}` placeholder in apply_command with the actual config_file path.
     """
     try:
-        formatted_command = apply_command.format(config_file=config_file)
+        # Substitute only the one placeholder. Formatting the whole
+        # string would break on any other braces in the operator's
+        # command (shell, awk, find, and JSON shaped arguments all
+        # use braces of their own).
+        formatted_command = apply_command.replace("{config_file}", config_file)
         logging.info(f"Applying configuration with command: {formatted_command}")
         result = subprocess.run(formatted_command, shell=True, capture_output=True, text=True)
         if result.returncode != 0:
@@ -108,47 +152,72 @@ def main():
     if num_iterations < 2:
         logging.error("Number of iterations must be at least 2.")
         sys.exit(1)
-    
+
+    # The tool certifies this configuration, so it reads it first.
+    if not read_and_check_config(config_file):
+        sys.exit(1)
+
     # Validate config file if requested
     if validate:
         if not validate_config(config_file):
             logging.error("Configuration validation failed. Exiting.")
             sys.exit(1)
 
-    # Prepare temporary directory
+    # Prepare temporary directory. Cleanup may only remove a
+    # directory this run created with mkdtemp. An operator named
+    # directory is never a deletion target, on any exit path: the
+    # tool puts nothing in it, and deleting it would remove only the
+    # operator's own files.
+    created_by_tool = False
     if temp_dir:
       try:
-          os.makedirs(temp_dir, exist_ok=True)  # Create temp dir if it doesn't exist.
+          os.makedirs(temp_dir, exist_ok=True)
       except OSError as e:
           logging.error(f"Failed to create temporary directory {temp_dir}: {e}")
           sys.exit(1)
     else:
-        temp_dir = tempfile.mkdtemp()  # Creates a temporary directory
+        temp_dir = tempfile.mkdtemp()
+        created_by_tool = True
         logging.info(f"Using temporary directory: {temp_dir}")
-    
+
+    def cleanup_temp_dir():
+        if created_by_tool:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logging.info(f"Temporary directory {temp_dir} cleaned up.")
+        else:
+            logging.info(f"Temporary directory {temp_dir} was named by the operator and is left in place.")
+
     initial_checksum = calculate_checksum(checksum_command)
     if initial_checksum is None:
         logging.error("Failed to calculate initial checksum. Exiting.")
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        cleanup_temp_dir()
         sys.exit(1)
     
-    checksums = [initial_checksum]
+    # The pre-application checksum is recorded for the log only. It
+    # is not part of the verdict: a first application that does its
+    # job is supposed to change the state.
+    checksums = []
 
     for i in range(num_iterations):
         logging.info(f"Iteration {i + 1}: Applying configuration.")
         if not apply_configuration(config_file, apply_command):
             logging.error(f"Iteration {i+1}: Configuration application failed. Exiting.")
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            cleanup_temp_dir()
             sys.exit(1)
         
         current_checksum = calculate_checksum(checksum_command)
         if current_checksum is None:
             logging.error(f"Iteration {i + 1}: Failed to calculate checksum. Exiting.")
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            cleanup_temp_dir()
             sys.exit(1)
         checksums.append(current_checksum)
 
-    idempotent = all(checksum == checksums[0] for checksum in checksums)
+    # Idempotent means the post-application checksums agree with
+    # each other: after the first application, applying again
+    # changes nothing.
+    if checksums and checksums[0] != initial_checksum:
+        logging.info("The first application changed the system state, as an application may. The verdict compares the post-application checksums with each other.")
+    idempotent = len(checksums) >= 2 and all(checksum == checksums[0] for checksum in checksums)
 
     if idempotent:
         logging.info("Configuration is idempotent.  System state remains consistent after multiple applications.")
@@ -156,8 +225,7 @@ def main():
         logging.warning("Configuration is NOT idempotent. System state changes after multiple applications.")
         logging.warning(f"Checksums: {checksums}") # Print all checksums for debugging
 
-    shutil.rmtree(temp_dir, ignore_errors=True) # Clean up the temporary directory
-    logging.info(f"Temporary directory {temp_dir} cleaned up.")
+    cleanup_temp_dir()
 
     if not idempotent:
         sys.exit(1) # Exit with error code if not idempotent
