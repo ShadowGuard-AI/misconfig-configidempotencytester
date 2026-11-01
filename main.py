@@ -35,9 +35,17 @@ def read_and_check_config(config_file):
             data = json.loads(raw)
         elif lower.endswith((".yaml", ".yml")):
             if yaml is None:
+                # So without PyYAML this pre-check certifies any non empty YAML
+                # file, including one no parser could read. The apply commands
+                # below would fail on such a file and end the run honestly,
+                # but the check itself has said nothing about the content.
                 return True  # Non-empty text; no parser available here.
             data = yaml.safe_load(raw)
         else:
+            # An unknown suffix also passes here, with no parse at all. The
+            # honesty this defers to validate_config only happens when the
+            # operator passed the validate flag; without it a text file
+            # full of prose is treated as a configuration worth applying.
             return True  # Content present; type honesty is validate_config's job.
     except Exception as e:
         logging.error(f"Configuration file {config_file} could not be parsed: {e}")
@@ -69,6 +77,10 @@ def validate_config(config_file):
     Validates the configuration file using yamllint or jsonlint based on the file extension.
     """
     try:
+        # This test is case sensitive where read_and_check_config above
+        # lowercases first, so a file named CONFIG.YAML passes the
+        # pre-check as YAML and fails validation here as an unknown
+        # type. The two halves of my own file disagree about it.
         if config_file.endswith((".yaml", ".yml")):
             result = subprocess.run(["yamllint", config_file], capture_output=True, text=True)
             if result.returncode != 0:
@@ -96,6 +108,12 @@ def calculate_checksum(checksum_command):
     Calculates the system state checksum using the provided command.
     """
     try:
+        # The verdict is only as steady as this command. Its whole
+        # stdout is the checksum, so a command whose output carries a
+        # timestamp, a process id, or an unsorted walk that changes
+        # order makes every run look non idempotent, and a command
+        # that hashes too little makes a changing system look stable.
+        # I cannot tell either case apart from inside here.
         result = subprocess.run(checksum_command, shell=True, capture_output=True, text=True)
         if result.returncode != 0:
             logging.error(f"Checksum command failed:\n{result.stderr}")
@@ -176,6 +194,11 @@ def main():
           logging.error(f"Failed to create temporary directory {temp_dir}: {e}")
           sys.exit(1)
     else:
+        # Nothing in this run ever uses the directory I am preparing.
+        # Neither command receives its path, and no file is written
+        # into it. It exists because an earlier shape of this tool
+        # planned to work in one, and the careful cleanup rules below
+        # now guard a directory that stays empty from birth to removal.
         temp_dir = tempfile.mkdtemp()
         created_by_tool = True
         logging.info(f"Using temporary directory: {temp_dir}")
@@ -217,6 +240,11 @@ def main():
     # changes nothing.
     if checksums and checksums[0] != initial_checksum:
         logging.info("The first application changed the system state, as an application may. The verdict compares the post-application checksums with each other.")
+    # Sampling is the limit of this test. I compare the states
+    # after each application, so a change that appears and then
+    # reverts between two of my samples, or that only shows on a
+    # third application pattern my iteration count does not reach,
+    # is invisible to the verdict.
     idempotent = len(checksums) >= 2 and all(checksum == checksums[0] for checksum in checksums)
 
     if idempotent:
